@@ -29,7 +29,9 @@ impl DurableObject for UserSession {
                     .storage()
                     .get::<String>("state")
                     .await
-                    .unwrap_or_else(|_| "{}".to_string());
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "{}".to_string());
                 Response::ok(stored)
             }
             (Method::Post, "/state") => {

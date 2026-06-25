@@ -21,7 +21,7 @@
     {
       "binding": "DB",
       "database_name": "shop-pilot-db",
-      "database_id": "REPLACE_AFTER_D1_CREATE"
+      "database_id": "a4e077f8-25a8-4a90-8b9b-f81b046eedc8"
     }
   ],
   // Run `wrangler kv namespace create CACHE` and paste the id here. Used for
@@ -29,7 +29,7 @@
   "kv_namespaces": [
     {
       "binding": "CACHE",
-      "id": "REPLACE_AFTER_KV_CREATE"
+      "id": "7fc645723ac84ad4b19245a41db0eea4"
     }
   ],
   // One Durable Object instance per (channel, user_id): owns conversation
