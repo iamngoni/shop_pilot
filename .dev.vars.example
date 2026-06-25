@@ -1,0 +1,4 @@
+# Copy to .dev.vars for `wrangler dev`. Never commit .dev.vars.
+TELEGRAM_BOT_TOKEN = ""
+SESSION_KEY = ""
+SENTRY_DSN = ""

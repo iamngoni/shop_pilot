@@ -1,0 +1,6 @@
+# Run wasm32 unit tests on Node via wasm-bindgen-test-runner.
+# Install the matching runner once:
+#   cargo install wasm-bindgen-cli --version 0.2.121
+# Then: cargo test --target wasm32-unknown-unknown
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
