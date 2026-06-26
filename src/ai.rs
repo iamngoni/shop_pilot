@@ -1,15 +1,13 @@
-//! The AI engine (wasm-only). Replaces the deterministic stub: an
-//! `agent-runtime` agent drives the conversation, calls grocery tools, and
-//! returns a structured `AiReply` we map to a `CanonicalReply`.
+//! The AI engine (wasm-only): an `agent-runtime` agent drives the conversation,
+//! calls grocery tools, and returns a structured `AiReply` → `CanonicalReply`.
 //!
-//! Three pieces live here:
-//!   * `WorkerHttpClient` — `agent-runtime`'s `HttpClient` over `worker::Fetch`
-//!   * `ShopPilotAgent`    — instructions + (mock) Sixty60 tools
-//!   * `respond`           — load history → run agent → persist history → reply
-//!
-//! Store tools are MOCK until the Sixty60 egress spike lands; the agent, the
-//! channel layer, and the structured contract are all real, so swapping mock
-//! tool bodies for the real Sixty60 adapter changes nothing above this file.
+//! Two paths run before/around the LLM:
+//!   * **Login** — a deterministic phone→OTP→birth-date state machine (handled
+//!     outside the LLM; structured input, not chat). On success the Sixty60
+//!     session cookies are stored per user.
+//!   * **Tools** — when the user has a session, search/cart hit the **real**
+//!     Sixty60 client (`sixty60.rs`); otherwise they use mock data so the demo
+//!     works logged-out. The real path is UNTESTED until a first live login.
 
 use std::sync::{Arc, Mutex};
 
@@ -26,6 +24,7 @@ use worker::Env;
 
 use crate::protocol::{CanonicalMessage, CanonicalReply, InboundEvent};
 use crate::reply::AiReply;
+use crate::sixty60::Sixty60Client;
 
 const MODEL: &str = "claude-haiku-4-5-20251001";
 const HISTORY_LIMIT: usize = 20;
@@ -36,30 +35,23 @@ South Africa. Prices are in South African Rand. You help the user build a grocer
 cart by chat.
 
 How to work:
-- When the user names items they want, use `search_products` to find matching \
-  products for each item.
+- Use `search_products` to find matching products for each item the user names.
 - If a search returns several plausible matches, do NOT guess — return a reply \
-  with kind \"choices\" asking the user to pick (fill `prompt` and `options`, each \
-  option an {id, label}).
-- Once a specific product is chosen, use `add_to_cart` with its sku_id, name, qty \
-  and price_cents.
-- Use `view_cart` to summarise what's in the cart.
+  with kind \"choices\" asking the user to pick (fill `prompt` and `options`).
+- Once a product is chosen, use `add_to_cart` with its sku_id, name, qty and \
+  price_cents.
+- Use `view_cart` to summarise the cart.
 - When the user wants to check out, call `get_checkout_link` and return a reply \
   with kind \"cart\" including cart_items, total_cents and checkout_url. We hand \
   off to the Sixty60 app for payment — you never take payment yourself.
+- If a tool reports the user isn't connected, tell them to type \"login\" to \
+  connect their Checkers Sixty60 account.
 
-Your FINAL answer is always a structured Reply:
-- kind \"text\": a normal conversational message in `text`.
-- kind \"choices\": ask the user to choose — set `prompt` and `options`.
-- kind \"cart\": show the cart — set `cart_items`, `total_cents`, and `checkout_url` \
-  when checking out.
+Your FINAL answer is always a structured Reply (kind \"text\", \"choices\", or \
+\"cart\"). Keep replies warm and concise.";
 
-Keep replies warm, concise, and natural. This is a demo running on a mock \
-catalogue, so prices and products are illustrative.";
-
-/// Top-level entry: turn one inbound message into a channel-agnostic reply.
-/// Never panics out — on any failure it returns a friendly fallback so the
-/// webhook still succeeds.
+/// Top-level entry: one inbound message → one channel-agnostic reply. Never
+/// panics out — any failure returns a friendly fallback.
 pub async fn respond(env: &Env, msg: &CanonicalMessage) -> CanonicalReply {
     match respond_inner(env, msg).await {
         Ok(reply) => reply,
@@ -71,17 +63,23 @@ pub async fn respond(env: &Env, msg: &CanonicalMessage) -> CanonicalReply {
 }
 
 async fn respond_inner(env: &Env, msg: &CanonicalMessage) -> anyhow::Result<CanonicalReply> {
+    let key = msg.user_key();
     let input = match &msg.event {
         InboundEvent::Message { text } => text.clone(),
         InboundEvent::Selected { option_id } => format!("I'll take this option: {option_id}"),
     };
 
-    let key = format!("conv:{}", msg.user_key());
-    let history = load_history(env, &key).await?;
+    // 1. Deterministic login flow takes priority over the LLM.
+    if let Some(reply) = handle_login(env, &key, &input).await? {
+        return Ok(reply);
+    }
 
+    // 2. Agent path. A stored session (if any) flips tools to the real store.
+    let session = load_session(env, &key).await?;
+    let history = load_history(env, &key).await?;
     let api_key = env.secret("ANTHROPIC_API_KEY").map_err(werr)?.to_string();
 
-    let agent = ShopPilotAgent::new();
+    let agent = ShopPilotAgent::new(session);
     let llm = Llm::builder()
         .provider(AgentProviderKind::Anthropic)
         .api_key(api_key)
@@ -101,11 +99,170 @@ async fn respond_inner(env: &Env, msg: &CanonicalMessage) -> anyhow::Result<Cano
     Ok(canonical)
 }
 
+// --- login state machine (phone → OTP → birth-date) -------------------------
+
+#[derive(Default, Serialize, Deserialize)]
+struct LoginState {
+    stage: String, // "number" | "otp" | "dob"
+    mobile: String,
+    otp_ref: String,
+    cookies: String,
+}
+
+/// Returns `Some(reply)` if the message was consumed by the login flow, else
+/// `None` (let the agent handle it).
+async fn handle_login(
+    env: &Env,
+    key: &str,
+    input: &str,
+) -> anyhow::Result<Option<CanonicalReply>> {
+    let trimmed = input.trim();
+    let state = load_login_state(env, key).await?;
+
+    // Not currently logging in: only start on an explicit command.
+    let Some(mut st) = state else {
+        if trimmed.eq_ignore_ascii_case("login") || trimmed.eq_ignore_ascii_case("/login") {
+            save_login_state(
+                env,
+                key,
+                &LoginState { stage: "number".into(), ..Default::default() },
+            )
+            .await?;
+            return Ok(Some(CanonicalReply::text(
+                "Let's connect your Checkers Sixty60 account. What's your mobile number? (e.g. 0712345678)",
+            )));
+        }
+        return Ok(None);
+    };
+
+    if trimmed.eq_ignore_ascii_case("cancel") {
+        clear_login_state(env, key).await?;
+        return Ok(Some(CanonicalReply::text("No problem — login cancelled.")));
+    }
+
+    match st.stage.as_str() {
+        "number" => {
+            let number = normalize_msisdn(trimmed);
+            let mut client = Sixty60Client::new();
+            match client.request_otp(&number).await {
+                Ok(otp_ref) => {
+                    let next = LoginState {
+                        stage: "otp".into(),
+                        mobile: number,
+                        otp_ref,
+                        cookies: client.session().to_string(),
+                    };
+                    save_login_state(env, key, &next).await?;
+                    Ok(Some(CanonicalReply::text(
+                        "I've sent an OTP to your phone. What's the code?",
+                    )))
+                }
+                Err(e) => {
+                    clear_login_state(env, key).await?;
+                    worker::console_warn!("request_otp failed: {e:?}");
+                    Ok(Some(CanonicalReply::text(
+                        "I couldn't start the login just now. Type \"login\" to try again.",
+                    )))
+                }
+            }
+        }
+        "otp" => {
+            let mut client = Sixty60Client::with_session(st.cookies.clone());
+            match client.verify_otp(&st.mobile, trimmed, &st.otp_ref).await {
+                Ok(()) => {
+                    st.stage = "dob".into();
+                    st.cookies = client.session().to_string();
+                    save_login_state(env, key, &st).await?;
+                    Ok(Some(CanonicalReply::text(
+                        "Great — one last step. What's your date of birth? (YYYY-MM-DD)",
+                    )))
+                }
+                Err(e) => {
+                    worker::console_warn!("verify_otp failed: {e:?}");
+                    Ok(Some(CanonicalReply::text(
+                        "That code didn't work. Try the code again, or type \"cancel\".",
+                    )))
+                }
+            }
+        }
+        "dob" => {
+            let mut client = Sixty60Client::with_session(st.cookies.clone());
+            match client.verify_date_of_birth(trimmed).await {
+                Ok(()) => {
+                    save_session(env, key, client.session()).await?;
+                    clear_login_state(env, key).await?;
+                    Ok(Some(CanonicalReply::text(
+                        "✅ You're connected to Checkers Sixty60! Tell me what you'd like to buy.",
+                    )))
+                }
+                Err(e) => {
+                    worker::console_warn!("verify_dob failed: {e:?}");
+                    Ok(Some(CanonicalReply::text(
+                        "I couldn't verify that. Send your date of birth as YYYY-MM-DD, or \"cancel\".",
+                    )))
+                }
+            }
+        }
+        _ => {
+            clear_login_state(env, key).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Normalize a SA mobile number to international form (27XXXXXXXXX).
+fn normalize_msisdn(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if let Some(rest) = digits.strip_prefix("27") {
+        format!("27{rest}")
+    } else if let Some(rest) = digits.strip_prefix('0') {
+        format!("27{rest}")
+    } else {
+        digits
+    }
+}
+
+// --- KV state ---------------------------------------------------------------
+
+async fn load_login_state(env: &Env, key: &str) -> anyhow::Result<Option<LoginState>> {
+    let kv = env.kv("CACHE").map_err(werr)?;
+    let raw = kv.get(&format!("login:{key}")).text().await.map_err(werr)?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+async fn save_login_state(env: &Env, key: &str, st: &LoginState) -> anyhow::Result<()> {
+    let kv = env.kv("CACHE").map_err(werr)?;
+    kv.put(&format!("login:{key}"), serde_json::to_string(st)?)
+        .map_err(werr)?
+        .execute()
+        .await
+        .map_err(werr)?;
+    Ok(())
+}
+
+async fn clear_login_state(env: &Env, key: &str) -> anyhow::Result<()> {
+    let kv = env.kv("CACHE").map_err(werr)?;
+    kv.delete(&format!("login:{key}")).await.map_err(werr)?;
+    Ok(())
+}
+
+async fn load_session(env: &Env, key: &str) -> anyhow::Result<Option<String>> {
+    let kv = env.kv("CACHE").map_err(werr)?;
+    let raw = kv.get(&format!("sess:{key}")).text().await.map_err(werr)?;
+    Ok(raw.filter(|s| !s.is_empty()))
+}
+
+async fn save_session(env: &Env, key: &str, cookies: &str) -> anyhow::Result<()> {
+    let kv = env.kv("CACHE").map_err(werr)?;
+    kv.put(&format!("sess:{key}"), cookies)
+        .map_err(werr)?
+        .execute()
+        .await
+        .map_err(werr)?;
+    Ok(())
+}
+
 // --- conversation history (KV) ----------------------------------------------
-//
-// KV is the pragmatic home for chat history today: a single user types
-// sequentially, so the lack of per-key locking doesn't bite. The `UserSession`
-// Durable Object remains the intended home once we need stronger consistency.
 
 #[derive(Serialize, Deserialize)]
 struct StoredMsg {
@@ -115,7 +272,7 @@ struct StoredMsg {
 
 async fn load_history(env: &Env, key: &str) -> anyhow::Result<Vec<ChatMessage>> {
     let kv = env.kv("CACHE").map_err(werr)?;
-    let raw = kv.get(key).text().await.map_err(werr)?;
+    let raw = kv.get(&format!("conv:{key}")).text().await.map_err(werr)?;
     let stored: Vec<StoredMsg> = match raw {
         Some(s) => serde_json::from_str(&s).unwrap_or_default(),
         None => Vec::new(),
@@ -141,19 +298,20 @@ async fn save_history(env: &Env, key: &str, history: &[ChatMessage]) -> anyhow::
             text: m.content.clone().unwrap_or_default(),
         })
         .collect();
-    let value = serde_json::to_string(&stored)?;
     let kv = env.kv("CACHE").map_err(werr)?;
-    kv.put(key, value).map_err(werr)?.execute().await.map_err(werr)?;
+    kv.put(&format!("conv:{key}"), serde_json::to_string(&stored)?)
+        .map_err(werr)?
+        .execute()
+        .await
+        .map_err(werr)?;
     Ok(())
 }
 
-/// Convert any worker error (`worker::Error`, `worker::kv::KvError`, …) into an
-/// `anyhow::Error` so the agent-runtime/anyhow result chain composes.
 fn werr<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-// --- the agent + (mock) Sixty60 tools ---------------------------------------
+// --- the agent + tools (real when a session exists, else mock) --------------
 
 struct CartLine {
     #[allow(dead_code)]
@@ -164,14 +322,14 @@ struct CartLine {
 }
 
 pub struct ShopPilotAgent {
+    /// Sixty60 session cookies, if the user is connected. `None` → mock tools.
+    session: Option<String>,
     cart: Arc<Mutex<Vec<CartLine>>>,
 }
 
 impl ShopPilotAgent {
-    pub fn new() -> Self {
-        Self {
-            cart: Arc::new(Mutex::new(Vec::new())),
-        }
+    pub fn new(session: Option<String>) -> Self {
+        Self { session, cart: Arc::new(Mutex::new(Vec::new())) }
     }
 }
 
@@ -204,20 +362,54 @@ impl Agent for ShopPilotAgent {
     fn tools(&self) -> ToolRegistry<()> {
         let mut r = ToolRegistry::new();
 
+        // search_products — real store when connected, else mock.
+        let session = self.session.clone();
         r.register(JsonTool::new(
             "search_products",
             "Search the Checkers Sixty60 catalogue for a grocery item. Returns candidate \
              products with sku_id, name, price_cents and stock.",
-            move |_c: (), a: SearchArgs| async move { Ok(mock_search(&a.query)) },
+            move |_c: (), a: SearchArgs| {
+                let session = session.clone();
+                SendWrapper::new(async move {
+                    match &session {
+                        Some(cookies) => {
+                            let mut client = Sixty60Client::with_session(cookies.clone());
+                            match client.search(&a.query).await {
+                                Ok(products) => Ok(json!({
+                                    "products": products.iter().map(|p| json!({
+                                        "sku_id": p.product_id,
+                                        "name": p.name,
+                                        "brand": p.brand,
+                                        "price_cents": p.price_cents,
+                                        "in_stock": p.in_stock,
+                                    })).collect::<Vec<_>>()
+                                })),
+                                Err(e) => Ok(json!({ "error": format!("{e:?}"), "products": [] })),
+                            }
+                        }
+                        None => Ok(mock_search(&a.query)),
+                    }
+                })
+            },
         ));
 
+        // add_to_cart — real store when connected, else local mock cart.
+        let session = self.session.clone();
         let cart = self.cart.clone();
         r.register(JsonTool::new(
             "add_to_cart",
             "Add a specific product (by sku_id) to the user's cart.",
             move |_c: (), a: AddArgs| {
+                let session = session.clone();
                 let cart = cart.clone();
-                async move {
+                SendWrapper::new(async move {
+                    if let Some(cookies) = &session {
+                        let mut client = Sixty60Client::with_session(cookies.clone());
+                        return match client.add_to_cart(&a.sku_id, a.qty.max(1)).await {
+                            Ok(()) => Ok(json!({ "ok": true })),
+                            Err(e) => Ok(json!({ "ok": false, "error": format!("{e:?}") })),
+                        };
+                    }
                     let size = {
                         let mut c = cart.lock().unwrap();
                         c.push(CartLine {
@@ -229,36 +421,46 @@ impl Agent for ShopPilotAgent {
                         c.len()
                     };
                     Ok(json!({ "ok": true, "cart_size": size }))
-                }
+                })
             },
         ));
 
+        // view_cart — real store when connected, else local mock cart.
+        let session = self.session.clone();
         let cart = self.cart.clone();
         r.register(JsonTool::new(
             "view_cart",
             "View the current cart contents and total.",
             move |_c: (), _a: NoArgs| {
+                let session = session.clone();
                 let cart = cart.clone();
-                async move { Ok(cart_json(&cart.lock().unwrap())) }
+                SendWrapper::new(async move {
+                    if let Some(cookies) = &session {
+                        let mut client = Sixty60Client::with_session(cookies.clone());
+                        return match client.fetch_cart().await {
+                            Ok(v) => Ok(v),
+                            Err(e) => Ok(json!({ "error": format!("{e:?}") })),
+                        };
+                    }
+                    Ok(cart_json(&cart.lock().unwrap()))
+                })
             },
         ));
 
+        // get_checkout_link — hand-off URL.
+        let session = self.session.clone();
         let cart = self.cart.clone();
         r.register(JsonTool::new(
             "get_checkout_link",
             "Get the Sixty60 hand-off link for the user to confirm and pay in the app.",
             move |_c: (), _a: NoArgs| {
+                let connected = session.is_some();
                 let cart = cart.clone();
                 async move {
-                    let total: u64 = cart
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(|l| l.price_cents * l.qty as u64)
-                        .sum();
+                    let total: u64 = cart.lock().unwrap().iter().map(|l| l.price_cents * l.qty as u64).sum();
                     Ok(json!({
-                        "checkout_url": "https://www.sixty60.co.za/cart",
-                        "total_cents": total,
+                        "checkout_url": "https://www.checkers.co.za/cart",
+                        "total_cents": if connected { Value::Null } else { json!(total) },
                     }))
                 }
             },
@@ -290,22 +492,15 @@ fn cart_json(lines: &[CartLine]) -> Value {
 
 fn slug(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
         .collect()
 }
 
-// --- worker::Fetch-backed HttpClient ----------------------------------------
+// --- worker::Fetch-backed HttpClient (for agent-runtime / Anthropic) --------
 
-/// `HttpClient` impl that routes `agent-runtime`'s provider calls through the
-/// Workers `Fetch` API. The non-`Send` JS futures are wrapped in `SendWrapper`
-/// to satisfy the trait's `Send` bound — safe because workerd is
-/// single-threaded.
+/// `HttpClient` impl routing provider calls through Workers `Fetch`. The
+/// non-`Send` JS futures are wrapped in `SendWrapper` to satisfy the trait's
+/// `Send` bound — safe because workerd is single-threaded.
 pub struct WorkerHttpClient;
 
 #[async_trait]
@@ -315,18 +510,11 @@ impl HttpClient for WorkerHttpClient {
     }
 
     async fn send_streaming(&self, request: HttpRequest) -> anyhow::Result<HttpStreamResponse> {
-        // run_structured only needs buffered `send`; we satisfy the streaming
-        // contract by delivering the whole body as a single chunk.
         let resp = self.send(request).await?;
         let bytes = resp.body;
         let body: HttpByteStream =
-            Box::pin(futures_util::stream::once(
-                async move { Ok::<_, anyhow::Error>(bytes) },
-            ));
-        Ok(HttpStreamResponse {
-            status: resp.status,
-            body,
-        })
+            Box::pin(futures_util::stream::once(async move { Ok::<_, anyhow::Error>(bytes) }));
+        Ok(HttpStreamResponse { status: resp.status, body })
     }
 }
 

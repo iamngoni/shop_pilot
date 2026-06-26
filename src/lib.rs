@@ -11,7 +11,6 @@
 
 pub mod protocol;
 pub mod reply;
-pub mod sixty60;
 pub mod telegram;
 
 // wasm-only: anything that touches the Workers runtime or the LLM agent.
@@ -19,5 +18,7 @@ pub mod telegram;
 pub mod ai;
 #[cfg(target_arch = "wasm32")]
 pub mod session;
+#[cfg(target_arch = "wasm32")]
+pub mod sixty60;
 #[cfg(target_arch = "wasm32")]
 mod worker_app;
