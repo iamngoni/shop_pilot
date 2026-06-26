@@ -69,6 +69,17 @@ async fn respond_inner(env: &Env, msg: &CanonicalMessage) -> anyhow::Result<Cano
         InboundEvent::Selected { option_id } => format!("I'll take this option: {option_id}"),
     };
 
+    // 0. "connect" command → issue a one-time code for the browser extension to
+    //    sync the user's Checkers session (the httpOnly cookies the Worker can't
+    //    capture itself).
+    if input.trim().eq_ignore_ascii_case("connect") {
+        let code = gen_code();
+        save_link(env, &code, &key).await?;
+        return Ok(CanonicalReply::text(format!(
+            "To connect your Checkers Sixty60 account:\n\n1. Install the Shop Pilot browser extension\n2. While signed in to checkers.co.za, open the extension\n3. Enter this code: {code}\n\n(Valid for 10 minutes.)"
+        )));
+    }
+
     // 1. Deterministic login flow takes priority over the LLM.
     if let Some(reply) = handle_login(env, &key, &input).await? {
         return Ok(reply);
@@ -220,6 +231,55 @@ fn normalize_msisdn(raw: &str) -> String {
     } else {
         digits
     }
+}
+
+// --- session capture (browser extension → /session) -------------------------
+
+/// Ingest a session captured by the browser extension: `{code, cookies}`.
+/// Resolves the one-time `code` to a user, stores their cookie set, consumes
+/// the code. Called from the Worker's `POST /session` route.
+pub async fn ingest_session(env: &Env, raw: &str) -> anyhow::Result<()> {
+    #[derive(Deserialize)]
+    struct Body {
+        code: String,
+        cookies: String,
+    }
+    let body: Body = serde_json::from_str(raw)?;
+    let kv = env.kv("CACHE").map_err(werr)?;
+    let user_key = kv
+        .get(&format!("link:{}", body.code.trim()))
+        .text()
+        .await
+        .map_err(werr)?
+        .ok_or_else(|| anyhow::anyhow!("invalid or expired code"))?;
+    if body.cookies.trim().is_empty() {
+        return Err(anyhow::anyhow!("no cookies in payload"));
+    }
+    kv.put(&format!("sess:{user_key}"), body.cookies)
+        .map_err(werr)?
+        .execute()
+        .await
+        .map_err(werr)?;
+    let _ = kv.delete(&format!("link:{}", body.code.trim())).await;
+    Ok(())
+}
+
+/// 6-digit connect code.
+fn gen_code() -> String {
+    let mut buf = [0u8; 4];
+    let _ = getrandom::fill(&mut buf);
+    format!("{:06}", u32::from_le_bytes(buf) % 1_000_000)
+}
+
+async fn save_link(env: &Env, code: &str, user_key: &str) -> anyhow::Result<()> {
+    let kv = env.kv("CACHE").map_err(werr)?;
+    kv.put(&format!("link:{code}"), user_key)
+        .map_err(werr)?
+        .expiration_ttl(600)
+        .execute()
+        .await
+        .map_err(werr)?;
+    Ok(())
 }
 
 // --- KV state ---------------------------------------------------------------

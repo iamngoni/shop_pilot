@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Shop Pilot Connector",
+  "version": "1.0.0",
+  "description": "Securely sync your Checkers Sixty60 session to your Shop Pilot chat assistant.",
+  "permissions": ["cookies", "storage"],
+  "host_permissions": [
+    "https://*.checkers.co.za/*",
+    "https://*.sixty60.co.za/*",
+    "https://shop-pilot-api.imngonii.workers.dev/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Connect to Shop Pilot"
+  }
+}
