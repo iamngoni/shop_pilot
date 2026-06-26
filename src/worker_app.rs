@@ -4,7 +4,7 @@
 
 use worker::{Context, Env, Request, Response, Result, Router, event};
 
-use crate::{engine, telegram};
+use crate::{ai, telegram};
 
 const TELEGRAM_BOT_TOKEN: &str = "TELEGRAM_BOT_TOKEN";
 
@@ -36,9 +36,9 @@ async fn handle_telegram_webhook(
         }
     };
 
-    // Engine: intent in, intent out. Stateless for now; the UserSession DO gets
-    // wired in once conversation state is needed.
-    let reply = engine::handle(&msg);
+    // AI engine: intent in, intent out. Loads/persists conversation history and
+    // runs the agent, returning a structured reply mapped to CanonicalReply.
+    let reply = ai::respond(&ctx.env, &msg).await;
 
     let token = ctx
         .secret(TELEGRAM_BOT_TOKEN)

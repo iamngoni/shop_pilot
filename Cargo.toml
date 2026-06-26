@@ -13,12 +13,26 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+# Schema derivation for the structured AI Reply envelope. All-target so the
+# pure `reply` module (Reply -> CanonicalReply mapping) stays natively testable.
+schemars = { version = "0.8", features = ["derive"] }
 
-# Worker runtime deps only compile for the wasm32 target. Pure modules
-# (protocol, engine, telegram parse/render) build natively so they can be
+# Worker runtime + AI deps only compile for the wasm32 target. Pure modules
+# (protocol, reply, telegram parse/render) build natively so they can be
 # unit-tested with a plain `cargo test`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
 worker = { version = "0.8.3", features = ["d1"] }
+# The channel-agnostic LLM agent core. default-features off drops the reqwest
+# backend (which can't compile to wasm); we supply a worker::Fetch-backed
+# HttpClient instead.
+agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", default-features = false }
+anyhow = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+# Wraps the non-Send worker::Fetch futures so they satisfy HttpClient's Send
+# bound. Safe because workerd is single-threaded. The `futures` feature makes
+# SendWrapper itself a Future so it can be awaited.
+send_wrapper = { version = "0.6", features = ["futures"] }

@@ -9,12 +9,14 @@
 //! The engine never knows which channel it is talking to, and never expresses
 //! presentation (no "buttons") — only intent (`Reply::choice`).
 
-pub mod engine;
 pub mod protocol;
+pub mod reply;
 pub mod sixty60;
 pub mod telegram;
 
-// wasm-only: anything that touches the Workers runtime.
+// wasm-only: anything that touches the Workers runtime or the LLM agent.
+#[cfg(target_arch = "wasm32")]
+pub mod ai;
 #[cfg(target_arch = "wasm32")]
 pub mod session;
 #[cfg(target_arch = "wasm32")]
