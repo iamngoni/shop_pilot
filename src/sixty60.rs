@@ -106,15 +106,42 @@ impl Sixty60Client {
 
     // --- shopping -----------------------------------------------------------
 
-    /// Search the catalogue; returns candidate products.
+    /// Search the catalogue; returns candidate products. Endpoint, body and
+    /// response shape confirmed from the live authenticated app (cookie-auth;
+    /// the BFF adds x-api-key/Cognito server-side).
     pub async fn search(&mut self, query: &str) -> StoreResult<Vec<Product>> {
-        let v = self
-            .post(
-                "/api/v2/search/products/",
-                json!({ "searchTerm": query, "pageNumber": 0, "pageSize": 10 }),
-            )
-            .await?;
+        let body = json!({
+            "storeContexts": self.store_contexts(),
+            "filterData": {
+                "filter": {
+                    "showAllDisplayVariants": false,
+                    "showNotRangedProducts": false,
+                    "productListSource": { "search": query },
+                    "paginationOptions": { "page": 0, "pageSize": 16 },
+                    "filterOptions": {
+                        "filterIds": [], "dealsOnly": false, "brandOptions": [],
+                        "departmentOptions": [], "serviceOptions": [], "facetOptions": []
+                    },
+                    "sortOptions": serde_json::Value::Null
+                },
+                "displayOptions": { "includeDisplayCategoryTree": false }
+            }
+        });
+        let v = self.post("/api/catalogue/get-products-filter", body).await?;
         Ok(parse_products(&v))
+    }
+
+    /// The user's store contexts, pulled from the `storeContexts` cookie
+    /// (URL-encoded JSON) — required in the search/cart request bodies.
+    fn store_contexts(&self) -> Value {
+        for c in self.cookies.split("; ") {
+            if let Some(val) = c.strip_prefix("storeContexts=") {
+                if let Ok(v) = serde_json::from_str::<Value>(&percent_decode(val)) {
+                    return v;
+                }
+            }
+        }
+        Value::Array(vec![])
     }
 
     /// Add a product to the user's cart.
@@ -216,46 +243,43 @@ impl Default for Sixty60Client {
     }
 }
 
-/// Defensively walk an arbitrary JSON response and pull out product-like objects.
-/// Tolerant of the exact envelope (`{products:[…]}`, `{data:{products:[…]}}`, …)
-/// since that's confirmed on the first live response.
+/// Find the `products` array in the get-products-filter response (`{products:[…]}`,
+/// possibly nested) and map each entry.
 fn parse_products(v: &Value) -> Vec<Product> {
-    fn find_array<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    fn find_products(v: &Value) -> Option<&Vec<Value>> {
         match v {
-            Value::Array(items) => {
-                if items.iter().any(is_product) {
-                    out.push(v);
+            Value::Object(m) => {
+                if let Some(Value::Array(a)) = m.get("products") {
+                    return Some(a);
                 }
-                for it in items {
-                    find_array(it, out);
-                }
+                m.values().find_map(find_products)
             }
-            Value::Object(map) => {
-                for val in map.values() {
-                    find_array(val, out);
-                }
-            }
-            _ => {}
+            Value::Array(a) => a.iter().find_map(find_products),
+            _ => None,
         }
     }
-    let mut arrays = Vec::new();
-    find_array(v, &mut arrays);
-    let mut products = Vec::new();
-    if let Some(arr) = arrays.into_iter().find_map(|a| a.as_array()) {
-        for item in arr {
-            if let Some(p) = product_from(item) {
-                products.push(p);
-            }
-        }
-    }
-    products
+    find_products(v)
+        .map(|arr| arr.iter().filter_map(product_from).collect())
+        .unwrap_or_default()
 }
 
-fn is_product(v: &Value) -> bool {
-    v.as_object().is_some_and(|o| {
-        o.keys()
-            .any(|k| matches!(k.to_lowercase().as_str(), "productid" | "product_id" | "barcode"))
-    })
+/// Percent-decode a cookie value (the `storeContexts` cookie is URL-encoded JSON).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn product_from(v: &Value) -> Option<Product> {
