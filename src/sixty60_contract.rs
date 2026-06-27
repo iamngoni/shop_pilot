@@ -192,6 +192,7 @@ pub(crate) fn build_cart_update_payload(
     delivery_address_id: &str,
     store_contexts: &Value,
     line_item_id: &str,
+    selected_weight_option_index: Option<usize>,
 ) -> Result<Value, String> {
     let mut carts = carts.to_vec();
     upsert_product_line_item(
@@ -200,6 +201,7 @@ pub(crate) fn build_cart_update_payload(
         service_option_id,
         quantity.max(1),
         line_item_id,
+        selected_weight_option_index,
     )?;
     Ok(json!({
         "carts": carts.iter().map(cart_update_item).collect::<Vec<_>>(),
@@ -214,6 +216,7 @@ fn upsert_product_line_item(
     service_option_id: &str,
     quantity: u32,
     line_item_id: &str,
+    selected_weight_option_index: Option<usize>,
 ) -> Result<(), String> {
     if !carts.iter().any(|cart| {
         str_at(cart, "/serviceOptionId")
@@ -251,6 +254,7 @@ fn upsert_product_line_item(
         service_option_id,
         quantity,
         line_item_id,
+        selected_weight_option_index,
     )?);
     Ok(())
 }
@@ -281,10 +285,16 @@ fn line_item_from_product(
     service_option_id: &str,
     quantity: u32,
     line_item_id: &str,
+    selected_weight_option_index: Option<usize>,
 ) -> Result<Value, String> {
     let price = product_price_cents(product)?;
     let selected_weight_range = product
-        .pointer("/variableWeightOptions/0")
+        .get("variableWeightOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            let index = selected_weight_option_index.unwrap_or(0);
+            options.get(index).or_else(|| options.first())
+        })
         .filter(|v| !v.is_null())
         .cloned()
         .unwrap_or(Value::Null);
@@ -643,6 +653,7 @@ mod tests {
             "addr-1",
             &json!([{ "storeId": "store-1" }]),
             "line-product-123",
+            None,
         )
         .unwrap();
 
@@ -697,6 +708,7 @@ mod tests {
             "addr-1",
             &json!([]),
             "unused-new-line",
+            None,
         )
         .unwrap();
 
@@ -709,6 +721,44 @@ mod tests {
         assert_eq!(
             payload["carts"][0]["lineItems"][0]["serviceOptionId"],
             "sixty-min-delivery"
+        );
+    }
+
+    #[test]
+    fn cart_update_payload_uses_selected_variable_weight_option() {
+        let carts = vec![json!({
+            "id": "cart-sixty",
+            "serviceOptionId": "sixty-min-delivery",
+            "lineItems": []
+        })];
+        let product = json!({
+            "id": "product-123",
+            "storeId": "store-1",
+            "serviceOptionId": "sixty-min-delivery",
+            "price": 99.99,
+            "variableWeightOptions": [
+                { "name": "300g", "minimumWeight": 300, "maximumWeight": 300 },
+                { "name": "500g", "minimumWeight": 500, "maximumWeight": 500 }
+            ]
+        });
+
+        let payload = build_cart_update_payload(
+            &carts,
+            &product,
+            "sixty-min-delivery",
+            3,
+            "addr-1",
+            &json!([]),
+            "line-product-123",
+            Some(1),
+        )
+        .unwrap();
+
+        let added = &payload["carts"][0]["lineItems"][0];
+        assert_eq!(added["quantity"], 3);
+        assert_eq!(
+            added["selectedWeightRange"],
+            json!({ "name": "500g", "minimumWeight": 500, "maximumWeight": 500 })
         );
     }
 }

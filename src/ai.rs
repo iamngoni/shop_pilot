@@ -31,7 +31,7 @@ use crate::protocol::{CanonicalMessage, CanonicalReply, Choice, InboundEvent};
 use crate::reply::AiReply;
 use crate::sixty60::{Sixty60Client, StoreError};
 
-const MODEL: &str = "claude-haiku-4-5-20251001";
+const MODEL: &str = "claude-sonnet-4-6";
 const HISTORY_LIMIT: usize = 20;
 
 const INSTRUCTIONS: &str = "\
@@ -57,6 +57,14 @@ How to work:
   item. For a braai, use normal serving assumptions for meat, starches, sides, \
   sauces, charcoal/firelighters, and non-alcoholic drinks. Do not add alcohol \
   unless the user explicitly asks for it.
+- When the user has already asked you to add something, or replies yes/cool/add \
+  it/perfect, do not ask for confirmation again. Use the prior context and \
+  execute the add.
+- For meat and other variable-weight products, Checkers normally offers weight \
+  options such as 300g or 500g. Pick the closest useful weight option and add \
+  an integer quantity of that option. Example: if 1.5kg is sensible and 500g is \
+  available, add qty 3 of the 500g option. Do not ask about loose weight or \
+  quantity format just because a product is sold by weight.
 - Never claim an item is added unless `add_to_cart` returned `ok: true` in this \
   same turn. Prior assistant messages and cart summaries are not proof of the \
   current cart.
@@ -161,10 +169,14 @@ async fn run_agent(
         let correction = format!(
             "Correction: your previous reply either claimed cart work without a verified \
              add_to_cart success, returned product buttons in auto mode, or said you were \
-             still working. You must complete any required search_products/add_to_cart tool \
-             calls before your final answer. If add_to_cart fails or is not called, say that \
-             nothing was added. In auto mode, do not return product candidate buttons; ask \
-             one short text clarification only if a required detail is genuinely missing. \
+             still working, or asked an avoidable confirmation/quantity question. You must \
+             complete any required search_products/add_to_cart tool calls before your final \
+             answer. If the item is meat or variable-weight, choose one of the available \
+             weight options and use an integer qty of that option. Example: 1.5kg with a \
+             500g option means add_to_cart qty=3. If \
+             add_to_cart fails or is not called, say that nothing was added. In auto mode, \
+             do not return product candidate buttons; ask one short text clarification only \
+             if a required detail is genuinely missing. \
              Original user request: {input}"
         );
         reply_result = llm
@@ -201,7 +213,9 @@ fn should_retry_unverified_reply(
     agent.successful_adds_snapshot().is_empty()
         && (matches!(preferences.mode, Some(ShoppingMode::Auto)) && reply.kind == "choices"
             || reply_claims_cart_success(reply)
-            || reply_is_working_placeholder(reply))
+            || reply_is_working_placeholder(reply)
+            || (matches!(preferences.mode, Some(ShoppingMode::Auto))
+                && reply_is_avoidable_auto_question(reply)))
 }
 
 fn verified_canonical_reply(
@@ -215,7 +229,10 @@ fn verified_canonical_reply(
     if !failed_adds.is_empty() {
         return CanonicalReply::text(failed_adds_reply(failed_adds));
     }
-    if reply_claims_cart_success(reply) || reply_is_working_placeholder(reply) {
+    if reply_claims_cart_success(reply)
+        || reply_is_working_placeholder(reply)
+        || reply_is_avoidable_auto_question(reply)
+    {
         return CanonicalReply::text(
             "I haven't added anything yet because I could not verify a Checkers cart update. Try once more with the item you want added.",
         );
@@ -296,6 +313,20 @@ fn reply_is_working_placeholder(reply: &AiReply) -> bool {
         || lower.contains("i am adding")
         || lower.contains("adding these now")
         || lower.contains("adding all")
+}
+
+fn reply_is_avoidable_auto_question(reply: &AiReply) -> bool {
+    let lower = reply_text(reply).to_ascii_lowercase();
+    lower.contains("sound good")
+        || lower.contains("can you confirm")
+        || lower.contains("please confirm")
+        || lower.contains("would you like me")
+        || lower.contains("should i add")
+        || lower.contains("sold per kg")
+        || lower.contains("sold by weight")
+        || lower.contains("quantity format")
+        || lower.contains("loose weight")
+        || lower.contains("standard pack")
 }
 
 fn reply_text(reply: &AiReply) -> String {
@@ -537,7 +568,7 @@ async fn handle_selected_option(
 
     let mut client = Sixty60Client::with_session(cookies);
     worker::console_log!("selected add_to_cart start: {}", product_log_ref(option_id));
-    match client.add_to_cart(option_id, 1).await {
+    match client.add_to_cart(option_id, 1, None).await {
         Ok(()) => {
             worker::console_log!("selected add_to_cart ok: {}", product_log_ref(option_id));
             save_session(env, key, client.session()).await?;
@@ -1519,8 +1550,14 @@ struct SearchArgs {
 struct AddArgs {
     sku_id: String,
     name: String,
+    /// Whole-number quantity accepted by Checkers for the selected product or
+    /// weight option.
     qty: u32,
     price_cents: u64,
+    /// For variable-weight items, the zero-based index from
+    /// search_products.variable_weight_options.
+    #[serde(default)]
+    selected_weight_option_index: Option<usize>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1566,6 +1603,10 @@ impl Agent for ShopPilotAgent {
                                             "brand": p.brand,
                                             "price_cents": p.price_cents,
                                             "in_stock": p.in_stock,
+                                            "variable_weight_options": p.variable_weight_options.iter().enumerate().map(|(index, option)| json!({
+                                                "index": index,
+                                                "option": option,
+                                            })).collect::<Vec<_>>(),
                                         })).collect::<Vec<_>>()
                                     }))
                                 }
@@ -1602,7 +1643,11 @@ impl Agent for ShopPilotAgent {
         let failed_adds = self.failed_adds.clone();
         r.register(JsonTool::new(
             "add_to_cart",
-            "Add a specific product (by sku_id) to the user's cart.",
+            "Add a specific product (by sku_id) to the user's cart. `qty` must be a \
+             whole-number count of the selected product/weight option. For variable-weight \
+             meat, choose from `variable_weight_options` returned by search_products, set \
+             selected_weight_option_index to that option's index, then add an integer \
+             quantity of that option, e.g. 500g option index with qty 3.",
             move |_c: (), a: AddArgs| {
                 let session = session.clone();
                 let cart = cart.clone();
@@ -1612,7 +1657,10 @@ impl Agent for ShopPilotAgent {
                     let cookies = session.lock().unwrap().clone();
                     if let Some(cookies) = cookies {
                         let mut client = Sixty60Client::with_session(cookies);
-                        return match client.add_to_cart(&a.sku_id, a.qty.max(1)).await {
+                        return match client
+                            .add_to_cart(&a.sku_id, a.qty.max(1), a.selected_weight_option_index)
+                            .await
+                        {
                             Ok(()) => {
                                 *session.lock().unwrap() = Some(client.session().to_string());
                                 successful_adds.lock().unwrap().push(CartWrite {

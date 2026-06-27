@@ -54,6 +54,7 @@ pub struct Product {
     pub brand: Option<String>,
     pub price_cents: u64,
     pub in_stock: bool,
+    pub variable_weight_options: Vec<Value>,
 }
 
 /// A Sixty60 session: the accumulated cookie header that authenticates the user.
@@ -330,7 +331,12 @@ impl Sixty60Client {
     }
 
     /// Add a product to the user's cart.
-    pub async fn add_to_cart(&mut self, product_id: &str, quantity: u32) -> StoreResult<()> {
+    pub async fn add_to_cart(
+        &mut self,
+        product_id: &str,
+        quantity: u32,
+        selected_weight_option_index: Option<usize>,
+    ) -> StoreResult<()> {
         let store_contexts = self.store_contexts();
         if store_contexts.as_array().is_none_or(Vec::is_empty) {
             return Err(StoreError::Parse(
@@ -358,6 +364,7 @@ impl Sixty60Client {
             &delivery_address_id,
             &store_contexts,
             &line_item_id(product_id),
+            selected_weight_option_index,
         )
         .map_err(StoreError::Parse)?;
         self.post(
@@ -630,6 +637,11 @@ fn product_from(v: &Value) -> Option<Product> {
         brand,
         price_cents,
         in_stock,
+        variable_weight_options: v
+            .get("variableWeightOptions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
