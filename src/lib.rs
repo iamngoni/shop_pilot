@@ -9,8 +9,11 @@
 //! The engine never knows which channel it is talking to, and never expresses
 //! presentation (no "buttons") — only intent (`Reply::choice`).
 
+pub(crate) mod login_flow;
+pub(crate) mod preferences;
 pub mod protocol;
 pub mod reply;
+pub(crate) mod sixty60_contract;
 pub mod telegram;
 
 // wasm-only: anything that touches the Workers runtime or the LLM agent.

@@ -75,7 +75,10 @@ impl AiReply {
                     .clone()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|o| Choice { id: o.id, label: o.label })
+                    .map(|o| Choice {
+                        id: o.id,
+                        label: o.label,
+                    })
                     .collect(),
             },
             "cart" => CanonicalReply::Cart(CartCard {
@@ -102,7 +105,10 @@ impl AiReply {
     /// natural-language summary, not the structured payload.
     pub fn log_text(&self) -> String {
         match self.kind.as_str() {
-            "choices" => self.prompt.clone().unwrap_or_else(|| "[asked a question]".to_string()),
+            "choices" => self
+                .prompt
+                .clone()
+                .unwrap_or_else(|| "[asked a question]".to_string()),
             "cart" => self
                 .text
                 .clone()
@@ -138,8 +144,14 @@ mod tests {
             text: None,
             prompt: Some("Which milk?".into()),
             options: Some(vec![
-                AiChoiceOption { id: "a".into(), label: "Full cream".into() },
-                AiChoiceOption { id: "b".into(), label: "Low fat".into() },
+                AiChoiceOption {
+                    id: "a".into(),
+                    label: "Full cream".into(),
+                },
+                AiChoiceOption {
+                    id: "b".into(),
+                    label: "Low fat".into(),
+                },
             ]),
             cart_items: None,
             total_cents: None,

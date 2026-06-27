@@ -1,7 +1,7 @@
 -- Shop Pilot — initial schema.
 -- Identity model: an internal user can be reached through one or more channel
--- identities (telegram/whatsapp). Store sessions are held per user, encrypted,
--- and never include the user's store password.
+-- identities (telegram/whatsapp). Store sessions are held per user and never
+-- include the user's store password.
 
 CREATE TABLE users (
   id          TEXT PRIMARY KEY,        -- internal uuid
@@ -17,12 +17,12 @@ CREATE TABLE channel_identities (
   PRIMARY KEY (channel, channel_user_id)
 );
 
--- A captured, encrypted store session. status drives re-auth prompts.
+-- A store session. status drives re-auth prompts.
 CREATE TABLE store_sessions (
   id              TEXT PRIMARY KEY,
   user_id         TEXT NOT NULL REFERENCES users(id),
   store           TEXT NOT NULL,        -- 'sixty60'
-  encrypted_token BLOB NOT NULL,        -- session credential, sealed with SESSION_KEY
+  session_token   BLOB NOT NULL,        -- session credential
   status          TEXT NOT NULL,        -- 'active' | 'expired' | 'revoked'
   expires_at      INTEGER,              -- unix seconds, if known
   created_at      INTEGER NOT NULL,

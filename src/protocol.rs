@@ -79,7 +79,15 @@ pub struct CartCard {
 #[derive(Debug, Clone)]
 pub enum CanonicalReply {
     Text(String),
-    Choice { prompt: String, options: Vec<Choice> },
+    Choice {
+        prompt: String,
+        options: Vec<Choice>,
+    },
+    WebApp {
+        text: String,
+        button_label: String,
+        url: String,
+    },
     Cart(CartCard),
 }
 
@@ -89,6 +97,21 @@ impl CanonicalReply {
     }
 
     pub fn choice(prompt: impl Into<String>, options: Vec<Choice>) -> Self {
-        CanonicalReply::Choice { prompt: prompt.into(), options }
+        CanonicalReply::Choice {
+            prompt: prompt.into(),
+            options,
+        }
+    }
+
+    pub fn web_app(
+        text: impl Into<String>,
+        button_label: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        CanonicalReply::WebApp {
+            text: text.into(),
+            button_label: button_label.into(),
+            url: url.into(),
+        }
     }
 }

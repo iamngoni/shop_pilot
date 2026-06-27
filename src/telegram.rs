@@ -46,7 +46,9 @@ pub fn parse_update(raw: &str) -> Result<Option<CanonicalMessage>, String> {
                 return Ok(Some(CanonicalMessage {
                     channel: ChannelKind::Telegram,
                     user_id: chat_id,
-                    event: InboundEvent::Message { text: text.to_string() },
+                    event: InboundEvent::Message {
+                        text: text.to_string(),
+                    },
                 }));
             }
             // Non-text messages (photos, stickers) are ignored for now.
@@ -55,6 +57,17 @@ pub fn parse_update(raw: &str) -> Result<Option<CanonicalMessage>, String> {
     }
 
     Ok(None)
+}
+
+/// Telegram shows a spinner for inline-button taps until the callback query is
+/// answered. Extract this separately so the Worker can acknowledge it before
+/// the AI/store work runs.
+pub fn callback_query_id(raw: &str) -> Option<String> {
+    serde_json::from_str::<Value>(raw)
+        .ok()?
+        .pointer("/callback_query/id")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 /// Render engine *intent* into a Telegram `sendMessage` payload. This is where
@@ -75,6 +88,21 @@ pub fn render(chat_id: &str, reply: &CanonicalReply) -> Value {
                 "reply_markup": { "inline_keyboard": keyboard }
             })
         }
+
+        CanonicalReply::WebApp {
+            text,
+            button_label,
+            url,
+        } => json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": {
+                "inline_keyboard": [[{
+                    "text": button_label,
+                    "web_app": { "url": url }
+                }]]
+            }
+        }),
 
         CanonicalReply::Cart(cart) => {
             let mut lines = vec!["🛒 Your cart:".to_string()];
@@ -131,6 +159,35 @@ pub async fn send(bot_token: &str, chat_id: &str, reply: &CanonicalReply) -> wor
     Ok(())
 }
 
+/// Acknowledge an inline-button tap so Telegram clears the client-side spinner.
+#[cfg(target_arch = "wasm32")]
+pub async fn answer_callback_query(bot_token: &str, callback_query_id: &str) -> worker::Result<()> {
+    use worker::wasm_bindgen::JsValue;
+    use worker::{Fetch, Headers, Method, Request, RequestInit};
+
+    let url = format!("https://api.telegram.org/bot{bot_token}/answerCallbackQuery");
+    let body = json!({ "callback_query_id": callback_query_id }).to_string();
+
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(&body)));
+
+    let req = Request::new_with_init(&url, &init)?;
+    let mut resp = Fetch::Request(req).send().await?;
+    if resp.status_code() >= 300 {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(worker::Error::RustError(format!(
+            "telegram answerCallbackQuery failed ({}): {detail}",
+            resp.status_code()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,9 +202,10 @@ mod tests {
 
     #[test]
     fn parses_button_tap_as_selected() {
-        let raw = r#"{"callback_query":{"message":{"chat":{"id":7}},"data":"milk:a"}}"#;
+        let raw = r#"{"callback_query":{"id":"cb-1","message":{"chat":{"id":7}},"data":"milk:a"}}"#;
         let m = parse_update(raw).unwrap().unwrap();
         assert!(matches!(m.event, InboundEvent::Selected { option_id } if option_id == "milk:a"));
+        assert_eq!(callback_query_id(raw), Some("cb-1".into()));
     }
 
     #[test]
@@ -160,9 +218,30 @@ mod tests {
     fn renders_choice_as_inline_keyboard() {
         let reply = CanonicalReply::choice(
             "Which milk?",
-            vec![crate::protocol::Choice { id: "m:a".into(), label: "Store brand".into() }],
+            vec![crate::protocol::Choice {
+                id: "product-123".into(),
+                label: "Store brand".into(),
+            }],
         );
         let payload = render("9", &reply);
         assert!(payload["reply_markup"]["inline_keyboard"].is_array());
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "product-123"
+        );
+    }
+
+    #[test]
+    fn renders_web_app_button() {
+        let reply = CanonicalReply::web_app(
+            "Connect your store",
+            "Connect Checkers",
+            "https://example.com/telegram/login",
+        );
+        let payload = render("9", &reply);
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            "https://example.com/telegram/login"
+        );
     }
 }

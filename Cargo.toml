@@ -9,10 +9,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = { version = "0.3", features = ["wasm_js"] }
-hex = "0.4"
-hmac = "0.12"
-sha2 = "0.10"
 # Schema derivation for the structured AI Reply envelope. All-target so the
 # pure `reply` module (Reply -> CanonicalReply mapping) stays natively testable.
 schemars = { version = "0.8", features = ["derive"] }
@@ -32,6 +28,8 @@ agent-runtime = { git = "https://github.com/iamngoni/agent-runtime", default-fea
 anyhow = "1"
 async-trait = "0.1"
 futures-util = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
 # Wraps the non-Send worker::Fetch futures so they satisfy HttpClient's Send
 # bound. Safe because workerd is single-threaded. The `futures` feature makes
 # SendWrapper itself a Future so it can be awaited.

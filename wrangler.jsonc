@@ -14,7 +14,8 @@
     "command": "worker-build --release"
   },
   "vars": {
-    "SENTRY_ENVIRONMENT": "development"
+    "SENTRY_ENVIRONMENT": "development",
+    "PUBLIC_BASE_URL": "https://shop-pilot-api.imngonii.workers.dev"
   },
   // Run `wrangler d1 create shop-pilot-db` and paste the returned id here.
   "d1_databases": [
@@ -44,7 +45,7 @@
   ],
   // Secrets (set with `wrangler secret put <NAME>` — never commit):
   //   TELEGRAM_BOT_TOKEN   — from @BotFather
-  //   SESSION_KEY          — symmetric key for encrypting store session tokens
+  //   ANTHROPIC_API_KEY    — model access for structured AI replies
   //   SENTRY_DSN           — optional; error capture is a no-op when unset
   "unsafe": {
     "bindings": [
